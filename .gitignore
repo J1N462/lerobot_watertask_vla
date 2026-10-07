@@ -1,0 +1,18 @@
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.pytest_cache/
+.ruff_cache/
+
+# 결과물·외부 파일은 저장소 밖 ~/UNITA_PAC2026/local/ (UNITA_LOCAL) 에 둔다. 폴더 안에 생길 수 있는 것들:
+outputs/
+third_party/
+*.mp4
+*.npz
+
+# PC 별 로봇 설정 (예시는 rollout/robot.env.example)
+robot.env
+!docs/media/*.mp4
+
+# 대회 내부 문서 (숙소·기차표 등 개인 정보, 깃에 올리지 않음)
+pac_docs/
