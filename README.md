@@ -27,7 +27,9 @@ an offline-ready launcher. 85 unit tests with CI.
 | 2 | **"Pour water"** | "I'll pour water." -> left arm grabs cup, right arm grabs bottle |
 | 3 | | Pour -> detect completion from wrist angle -> **"Poured to the target amount."** |
 | 4 | | Place cup at marked spot and return -> **"Cup placed. Enjoy."** -> back to step 1 |
-| Stop | **"Stop"** or Space while pouring | "Stopped." -> **upright the bottle first -> retrace the path backwards to return cup and bottle** -> "Returned to the original position." |
+| Stop | **"Stop"** or Space while pouring | Upright the bottle first -> "Stopped." -> **pause and wait for "go back" / "continue"** |
+| Go back | **"Go back"** (Space / `r`) while paused, or 20 s of silence | **Retrace the path backwards to return cup and bottle** -> "Returned to the original position." |
+| Continue | **"Continue"** / "resume" / "pour" (`c`) while paused | "I'll continue pouring." -> the policy resumes pouring from the current pose |
 
 Water volume is matched by **filling only the target amount into the bottle and pouring it fully** (transparent
 water cannot be reliably read from a camera).
@@ -89,8 +91,8 @@ bash run_demo.sh --single --policy <single-arm checkpoint> --thresholds <single-
 
 | Control | Waiting | Pouring | Rewinding |
 |---|---|---|---|
-| Voice | "Pour water" -> start | "Stop" -> stop routine | (not listening) |
-| Keyboard | `p`+Enter start, `q`+Enter quit | **Space / `s`** stop routine, `q` quit after stop | **Space = immediate freeze (emergency)** |
+| Voice | "Pour water" -> start | "Stop" -> stop, then "go back" / "continue" | (not listening) |
+| Keyboard | `p`+Enter start, `q`+Enter quit | **Space / `s`** stop, then Space/`r` go back / `c` continue, `q` quit | **Space = immediate freeze (emergency)** |
 | Ctrl+C | quit | quit after stop routine | immediate freeze |
 
 Common options (passed through to `pour_rollout.py`):
@@ -102,7 +104,8 @@ Common options (passed through to `pour_rollout.py`):
 | `--no-voice-stop` | on | Disable voice stop while pouring, keyboard only |
 | `--untilt-s 2.5` | 1.5 | Increase if water sloshes while uprighting the bottle on stop |
 | `--rewind-speed 0.5` | 0.7 | Lower if rewind feels too fast |
-| `--stop-mode freeze` | `rewind` | Freeze in place on stop instead of rewinding (old behavior) |
+| `--stop-mode rewind` | `ask` | Rewind immediately on stop without asking (`freeze` = stay in place) |
+| `--pause-s 30` | 20 | How long to wait for "go back" / "continue" after a stop (rewinds when it elapses) |
 | `--post-done-s` | 25 | Max wait for the cleanup motion after completion |
 
 ## Control Flow
@@ -118,7 +121,9 @@ flowchart LR
     end
     MIC -->|pouring, separate process| VSTOP[stop-word detection]
     KEY[Space / s] --> STOPR
-    VSTOP --> STOPR[Stop routine<br/>upright bottle -> rewind]
+    VSTOP --> STOPR[Stop<br/>upright bottle -> wait]
+    STOPR -->|go back| BACK[rewind -> original position]
+    STOPR -->|continue| ACT
     DET -->|done| TTS1[Poured to target amount]
     DET -->|1 s settle after cleanup| TTS2[Cup placed -> waiting]
 ```
@@ -129,12 +134,14 @@ flowchart LR
 - **Normal termination**: after completion the policy places the cup down; when arms and grippers hold within
   15 deg of the start pose for 1 s, it ends (up to 25 s).
 - **Stop routine** (before pouring completes): (1) if the right wrist is tilted 15 deg or more, upright it to the
-  pose just before tilting over 1.5 s; (2) replay the actually-sent command path in reverse at 0.7x speed — the cup
-  and bottle return to where they were picked up and the grippers open; (3) finish at the pose observed when
-  pouring started over 0.5 s (precise return even if the policy's first command jumped). It rewinds the sent
-  commands, not the observations (commanding observations would slacken a gripping gripper and let a weighted arm
-  sag further). A stop after pouring completes freezes in place instead of rewinding (rewinding would re-grab the
-  cup already placed down).
+  pose just before tilting over 1.5 s, then pause and wait for "go back" / "continue" ("continue" -> the policy
+  resumes; the mic is muted while feedback plays); on "go back", (2) replay the actually-sent command path in
+  reverse at 0.7x speed — the cup and bottle return to where they were picked up and the grippers open; (3) finish
+  at the pose observed when pouring started over 0.5 s (precise return even if the policy's first command jumped).
+  It rewinds the sent commands, not the observations (commanding observations would slacken a gripping gripper and
+  let a weighted arm sag further). Tilted (pouring) frames are skipped on the way back so it does not tilt again
+  (e.g. after a "continue" followed by another stop). A stop after pouring completes freezes in place instead of
+  rewinding (rewinding would re-grab the cup already placed down).
 - **Voice stop while pouring**: a separate process checks the last 2 s every 0.5 s with Whisper (so the control
   loop is never blocked). It only watches for stop words, and errs toward stopping, so it is safe. It does not wait
   for the end of speech, so response is ~1 s even under continued noise. Policy inference is up to 77 ms/chunk under

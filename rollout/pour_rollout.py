@@ -77,7 +77,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from backends import JOINT_KEYS  # noqa: E402
 from keys import RawKeys  # noqa: E402
 from paths import DATASET, GITHUB, MODEL_REPO, OUTPUTS, THRESHOLDS  # noqa: E402
-from pour_detector import DONE, PourDetector, PourDetectorConfig  # noqa: E402
+from pour_detector import DONE, POURING, READY, PourDetector, PourDetectorConfig  # noqa: E402
 
 FPS = 30
 ROLL = JOINT_KEYS.index("right_wrist_roll.pos")  # 10
@@ -306,6 +306,14 @@ class Policy:
 # --------------------------------------------------------------------------- #
 # 한 번의 붓기
 # --------------------------------------------------------------------------- #
+def match_pause(text: str) -> str | None:
+    """일시정지 중 받아쓴 문장 → back / pour / resume / stop (고르는 말이 정지어보다 우선)."""
+    sys.path.insert(0, str(GITHUB / "stt"))
+    import voice_command as vc
+
+    return vc.match_command(text, priority=vc.PAUSE_PRIORITY)
+
+
 def clamp_step(cmd, ref, max_deg, max_grip):
     """직전 명령(ref) 대비 프레임당 변화량 제한. 몸통 관절은 도, 그리퍼는 0~100 단위."""
     lim = np.full(12, np.inf, np.float32)
@@ -349,8 +357,10 @@ def rewind_plan(
     untilt = []
     if det.baseline is not None:
         tilt = det.cfg.sign * (np.asarray(path, dtype=np.float32)[: len(P), ROLL] - det.baseline)
+        tilt_cmd = det.cfg.sign * (P[:, ROLL] - det.baseline)
         if tilt[-1] >= untilt_deg:
-            low = np.where(tilt < untilt_deg)[0]
+            # 관측·명령 둘 다 덜 기울었던 프레임 (팔이 명령을 늦게 따라와 관측만 보면 목표가 아직 기울어 있다)
+            low = np.where((tilt < untilt_deg) & (tilt_cmd < untilt_deg))[0]
             if len(low):
                 cut = int(low[-1])
                 m = max(int(untilt_s * FPS), 1)
@@ -364,6 +374,12 @@ def rewind_plan(
         )[0]
         lo = int(near[-1]) if len(near) else 0
     rev = P[lo : cut + 1][::-1]
+    if det.baseline is not None:  # 되감는 중 다시 기울이지 않게: 기울어 있던(붓던) 프레임은 건너뛴다
+        T = det.cfg.sign * (np.asarray(path, dtype=np.float32)[: len(P), ROLL] - det.baseline)
+        Tc = det.cfg.sign * (P[:, ROLL] - det.baseline)
+        keep = ((T < untilt_deg) & (Tc < untilt_deg))[lo : cut + 1][::-1]
+        keep[[0, -1]] = True
+        rev = rev[keep]
     n = int((len(rev) - 1) / speed) + 1
     back = []
     for k in range(n):
@@ -517,6 +533,7 @@ def run_pour(args, robot, policy, tts, det_cfg, run_dir: Path, run_idx: int, voi
     warn_n, last_warn = 0, -10.0
     t_start = time.perf_counter()
     step = 0
+    test_stop = {"done": False}
 
     def ev(name, t):
         events_all.append((round(t, 3), name))
@@ -528,6 +545,109 @@ def run_pour(args, robot, policy, tts, det_cfg, run_dir: Path, run_idx: int, voi
         print()  # 상태줄 다음 줄에
         subtitle.update(text=tts.say(key) or key, t=t)
         return ev(f"tts:{key}", t)
+
+    def home_refs() -> list[np.ndarray]:
+        refs = [path[0]]
+        sp = getattr(args, "start_pose", None)
+        if sp is not None and len(sp) in (6, 12):
+            r = np.array(path[0], dtype=np.float32)  # 한 팔이면 왼팔 칸은 그대로
+            r[12 - len(sp) :] = sp
+            refs.append(r)
+        return refs
+
+    def read_state():
+        obs = robot.get_observation()
+        state = np.array([obs[k] for k in JOINT_KEYS], dtype=np.float32)
+        # wrist_roll 은 ±180° 에서 부호가 뒤집힌다 → 이어 붙인 연속 각도로 감지기·되감기에 쓴다.
+        # (기준 자세가 큰 팔에서 붓다가 180° 를 넘으면 '복귀' 로 오판해 중간에 DONE 이 났다: follower1 실측)
+        raw_roll = float(state[ROLL])
+        if roll_prev[0] is not None and abs(raw_roll - roll_prev[0]) > 180:
+            roll_prev[1] -= 360 if raw_roll > roll_prev[0] else -360
+        roll_prev[0] = raw_roll
+        state[ROLL] = raw_roll + roll_prev[1]
+        return obs, state
+
+    def pause(t, keys) -> str:
+        """붓는 중 정지 (--stop-mode ask): 기울어 있으면 세운 뒤 멈춰서 기다린다.
+        "돌아가"(Space·r) → back = 되감기, "계속 해줘"(c) → resume = 정책 이어서, q → quit,
+        --pause-s 동안 아무 말 없으면 timeout (= 되감기). 세우는 동안의 관측·명령도 path·sent_path 에 넣어
+        나중에 되감기가 지금 자세에서 시작하게 한다 (rewind_plan 은 기울어 있던 프레임을 건너뛴다)."""
+        nonlocal prev_sent, t_start
+        t0 = time.perf_counter()
+        if voice_stop is not None:  # 안내 음성이 명령으로 들리지 않게 잠시 끔
+            voice_stop.disarm()
+        # 안내는 세우기가 끝난 뒤에: "멈춰" 직후 바로 말하면 어색하다 (사용자 의견). 멈추고 세우는 동작이
+        # 먼저 반응이 되고, 최소 --pause-say-s 뒤에 말한다.
+        plan, n_untilt = rewind_plan(path, sent_path, det, args.untilt_deg, args.untilt_s, 1.0)
+        # 세우기 뒤 최대 1s: 팔이 마지막 목표를 따라올 때까지 같은 목표 유지 (관측이 아직 기울어 있으면
+        # 되감기가 세우기를 한 번 더 한다)
+        hold = [plan[n_untilt - 1]] * FPS if n_untilt else []
+        for i, target in enumerate(list(plan[:n_untilt]) + hold):
+            if (
+                i >= n_untilt
+                and det.baseline is not None
+                and det.cfg.sign * (path[-1][ROLL] - det.baseline) < args.untilt_deg
+            ):
+                break
+            lt = time.perf_counter()
+            _, state = read_state()
+            sent = clamp_step(target, prev_sent, args.max_step_deg, args.max_step_gripper)
+            out = robot.send_action({k: float(v) for k, v in zip(JOINT_KEYS, sent)})
+            if isinstance(out, dict) and all(k in out for k in JOINT_KEYS):
+                sent = np.array([out[k] for k in JOINT_KEYS], dtype=np.float32)
+            path.append(state)
+            sent_path.append(sent)
+            prev_sent = sent
+            row = dict(step=-1, t=t, event="pause_untilt")
+            row.update({f"obs_{i}": float(v) for i, v in enumerate(state)})
+            row.update({f"cmd_{i}": float(v) for i, v in enumerate(sent)})
+            rows.append(row)
+            if hasattr(robot, "set_overlay"):
+                robot.set_overlay("정지 · 물통 세우기")
+            if not args.fast:
+                dt = time.perf_counter() - lt
+                if dt < 1 / FPS:
+                    precise_sleep(1 / FPS - dt)
+        if not args.fast:
+            time.sleep(max(0.0, args.pause_say_s - (time.perf_counter() - t0)))
+        say("stopped", t)
+        tts.wait(timeout=8.0)
+        time.sleep(0.3)  # 스피커 잔향
+        if voice_stop is not None:
+            voice_stop.arm()
+        print(
+            "[일시정지] '돌아가' → 되감기 / '계속 해줘' → 이어서  (키: Space·r = 돌아가, c = 계속, q = 종료)"
+        )
+        if hasattr(robot, "set_overlay"):
+            robot.set_overlay("정지 · '돌아가' / '계속 해줘' 기다리는 중")
+        choice, tw = None, time.perf_counter()
+        while choice is None:
+            k = keys.poll() or ""
+            heard = voice_stop.poll_command() if voice_stop is not None else None
+            if heard:  # 일시정지 우선순위로 다시 판정 ("그만 돌아가" → back)
+                heard = (match_pause(heard[1]) or heard[0], heard[1])
+            waited = time.perf_counter() - tw
+            if "q" in k or "Q" in k:
+                choice = "quit"
+            elif any(c in k for c in " rRsS") or (heard and heard[0] == "back"):
+                choice = "back"
+            elif "c" in k or "C" in k or (heard and heard[0] in ("resume", "pour")):
+                choice = "resume"
+            elif args.test_pause_cmd and (args.fast or waited >= 1.0):
+                choice = args.test_pause_cmd
+            elif waited >= args.pause_s:
+                choice = "timeout"
+            else:
+                time.sleep(0.03)
+        print(f"[일시정지] → {choice} ({time.perf_counter() - t0:.1f}s 멈춤)")
+        ev(f"pause:{choice}", t)
+        if choice == "resume":
+            policy.reset()  # 멈추기 전 행동 묶음을 버리고 지금 장면에서 새로 계산
+            if det.state == POURING:  # 세워서 기울기가 돌아온 걸 '다 따름'으로 보지 않게
+                det.state, det._cnt = READY, 0
+            if not args.fast:  # 시간 초과(--timeout-s)는 멈춰 있던 시간을 빼고 센다
+                t_start += time.perf_counter() - t0
+        return choice
 
     with RawKeys() as keys:
         if not keys.enabled:
@@ -553,14 +673,32 @@ def run_pour(args, robot, policy, tts, det_cfg, run_dir: Path, run_idx: int, voi
 
                 # ---- 수동 정지 (키) ----
                 k = keys.poll() or ""
-                if args.test_stop_at is not None and t >= args.test_stop_at:
-                    k += "s"  # 시험용: 정지 키를 누른 것처럼
+                if args.test_stop_at is not None and t >= args.test_stop_at and not test_stop["done"]:
+                    k += "s"  # 시험용: 정지 키를 누른 것처럼 (한 번만)
+                    test_stop["done"] = True
                 if "q" in k or "Q" in k:
                     stop_reason, quit_req = "quit", True
                 elif " " in k or "s" in k or "S" in k:
                     stop_reason = "manual"
                 elif voice_stop is not None and voice_stop.poll():
                     stop_reason = "voice"
+                if (
+                    stop_reason
+                    and args.stop_mode == "ask"
+                    and stop_reason in ("manual", "voice")
+                    and done_t is None
+                ):
+                    evs.append(ev(f"stop:{stop_reason}", t))
+                    rows.append(dict(step=step, t=t, event=";".join(evs)))
+                    evs = []
+                    choice = pause(t, keys)
+                    if choice == "resume":
+                        stop_reason = None
+                        evs.append(say("resume", t))
+                        continue
+                    if choice == "quit":
+                        stop_reason, quit_req = "quit", True
+                    break
                 if stop_reason:
                     evs.append(say("stopped", t))
                     evs.append(ev(f"stop:{stop_reason}", t))
@@ -568,16 +706,8 @@ def run_pour(args, robot, policy, tts, det_cfg, run_dir: Path, run_idx: int, voi
                     break
 
                 # ---- 관측 → 정책 → 행동 ----
-                obs = robot.get_observation()
+                obs, state = read_state()
                 t_obs = time.perf_counter()
-                state = np.array([obs[k] for k in JOINT_KEYS], dtype=np.float32)
-                # wrist_roll 은 ±180° 에서 부호가 뒤집힌다 → 이어 붙인 연속 각도로 감지기·되감기에 쓴다.
-                # (기준 자세가 큰 팔에서 붓다가 180° 를 넘으면 '복귀' 로 오판해 중간에 DONE 이 났다: follower1 실측)
-                raw_roll = float(state[ROLL])
-                if roll_prev[0] is not None and abs(raw_roll - roll_prev[0]) > 180:
-                    roll_prev[1] -= 360 if raw_roll > roll_prev[0] else -360
-                roll_prev[0] = raw_roll
-                state[ROLL] = raw_roll + roll_prev[1]
                 path.append(state)
                 new_chunk = policy.will_infer()
                 cmd = policy(obs)
@@ -642,10 +772,16 @@ def run_pour(args, robot, policy, tts, det_cfg, run_dir: Path, run_idx: int, voi
                 if len(path) > 1:
                     d = np.abs(path[-1] - path[-2])
                     still = d[ARM].max() < args.settle_deg and d[GRIP].max() < args.settle_deg
-                    dev = np.abs(path[-1][ARM] - path[0][ARM]).max()
-                    left_home = left_home or dev > args.home_tol_deg + args.away_deg
+                    left_home = left_home or (
+                        np.abs(path[-1][ARM] - path[0][ARM]).max() > args.home_tol_deg + args.away_deg
+                    )
+                    # '시작 자세' = 붓기 시작 때 자세 또는 시연의 쉬는 자세 (기준값 파일 start_pose) 중 가까운 쪽.
+                    # 팔을 다른 자세에 둔 채 시작해도 정책은 학습한 쉬는 자세로 돌아간다 (follower1 실측: 34° 차이로
+                    # 정착 판정이 안 돼 "컵을 놓았습니다" 없이 25s 뒤 끝남).
+                    homes = home_refs()
+                    dev = min(np.abs(path[-1][ARM] - h[ARM]).max() for h in homes)
                     # 그리퍼도 시작 때 값 근처여야 (컵을 쥔 채 시작 자세를 지나가는 건 '돌아옴'이 아님)
-                    grip_home = np.abs(path[-1][GRIP] - path[0][GRIP]).max() < args.grip_tol
+                    grip_home = min(np.abs(path[-1][GRIP] - h[GRIP]).max() for h in homes) < args.grip_tol
                     still_n = still_n + 1 if (still and dev < args.home_tol_deg) else 0
                     home_n = home_n + 1 if (still and dev < args.home_tol_deg and grip_home) else 0
                 if done_t is not None and t - done_t >= 2.0 and still_n >= args.settle_s * FPS:
@@ -707,9 +843,15 @@ def run_pour(args, robot, policy, tts, det_cfg, run_dir: Path, run_idx: int, voi
             if voice_stop is not None:  # "정지했습니다" 안내를 다시 듣지 않게 바로 끈다
                 voice_stop.disarm()
         rewind_info = None
-        if args.stop_mode == "rewind" and stop_reason in REWIND_ON and done_t is None and len(sent_path) > 1:
+        if (
+            args.stop_mode in ("rewind", "ask")
+            and stop_reason in REWIND_ON
+            and done_t is None
+            and len(sent_path) > 1
+        ):
             t_rw = (step / FPS) if args.fast else time.perf_counter() - t_start
             events_all.append((round(t_rw, 3), "rewind:start"))
+            tts.say("going_back")  # "원래 자리로 돌아가겠습니다." (돌아가 / 시간초과 / 종료)
             rewind_info = rewind(args, robot, path, sent_path, det, keys, rows)
             events_all.append((round(t_rw + rewind_info["duration_s"], 3), f"rewind:{rewind_info['result']}"))
             if rewind_info["result"] == "home":
@@ -934,9 +1076,23 @@ def parse_args(argv=None):
     )
     g.add_argument(
         "--stop-mode",
-        choices=["rewind", "freeze"],
-        default="rewind",
-        help="DONE 전 정지 때: rewind = 지나온 경로를 거꾸로 재생해 복귀, freeze = 그 자리에서 멈춤",
+        choices=["ask", "rewind", "freeze"],
+        default="ask",
+        help="DONE 전 정지 때: ask = 세운 뒤 멈춰서 '돌아가'(되감기)/'계속 해줘'(이어서) 기다림, "
+        "rewind = 바로 되감기, freeze = 그 자리에서 멈춤",
+    )
+    g.add_argument("--pause-s", type=float, default=20.0, help="ask: 이 시간 동안 아무 말 없으면 되감기 복귀")
+    g.add_argument(
+        "--pause-say-s",
+        type=float,
+        default=0.8,
+        help="ask: 정지 뒤 '정지했습니다.' 를 말하기까지 최소 시간 (물통 세우기가 더 길면 세운 뒤)",
+    )
+    g.add_argument(
+        "--test-pause-cmd",
+        choices=["back", "resume"],
+        default=None,
+        help="시험용: 정지 뒤 이 명령을 들은 것처럼",
     )
     g.add_argument("--rewind-speed", type=float, default=0.7, help="되감기 배속 (1 = 원래 속도)")
     g.add_argument(
@@ -991,6 +1147,7 @@ def main(argv=None):
     assert th["joint"] == ("wrist_roll.pos" if single else "right_wrist_roll.pos"), th["joint"]
     if args.timeout_s is None:
         args.timeout_s = float(th["timeout_suggest_s"])
+    args.start_pose = th.get("start_pose")  # 시연의 쉬는 자세 (정착 판정에 함께 씀, 없으면 붓기 시작 자세만)
     det_cfg = PourDetectorConfig(
         tilt_off=th["tilt_off"],
         return_off=th["return_off"],
