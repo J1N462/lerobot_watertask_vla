@@ -4,6 +4,26 @@
 
 **UNITA Manipulation (Incheon National University)** · PAC 2026 Physical AI Challenge — Track ① self-selected topic.
 
+> **Summary:** A bimanual SO-101 robot pours water on a spoken command — an ACT policy drives both arms, with voice
+> commands, completion detection, spoken feedback and a safe stop/rewind routine built around it.
+>
+> **Award:** Physical AI Hub Award, PAC 2026 (Physical AI Challenge)
+>
+> **Demo (real robot):** [TBD] · Sim demo below
+>
+> **My role:** [TBD]
+
+### How to run (quick start)
+
+```bash
+conda activate lerobot-gpu
+python tools/offline_check.py --block-network   # model, Whisper and mic load without internet
+bash run_demo.sh --sim --sim-render window      # no hardware: recorded video + MuJoCo arms
+bash run_demo.sh                                # real robot (configure robot.env first, see Laptop Setup)
+```
+
+Details: [Laptop Setup](#laptop-setup) · [Running (Rollout)](#running-rollout) · [Training](#training-desktop)
+
 A bimanual SO-101 robot (LeRobot `bi_so_follower`) pours water on a spoken command. The robot grabs a cup with
 its left arm, tilts a bottle with its right arm, pours, places the cup down, and announces completion. An ACT
 policy trained from teleoperated demos drives both arms; everything around the policy — voice recognition,
